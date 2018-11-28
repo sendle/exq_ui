@@ -8,7 +8,7 @@ defmodule ExqUi.RouterPlug do
       if options[:exq_opts] do
         options[:exq_opts]
       else
-        [name: Exq.Api.Server.server_name(nil)]
+        [name: Exq.Api.Server.server_name(ExqUi)]
       end
     Keyword.put(options, :exq_opts, enq_opts)
   end
@@ -45,8 +45,9 @@ defmodule ExqUi.RouterPlug do
       {:ok, processed} = Exq.Api.stats(conn.assigns[:exq_name], "processed")
       {:ok, failed} = Exq.Api.stats(conn.assigns[:exq_name], "failed")
       {:ok, busy} = Exq.Api.busy(conn.assigns[:exq_name])
-      {:ok, scheduled} = Exq.Api.queue_size(conn.assigns[:exq_name], :scheduled)
-      {:ok, retrying} = Exq.Api.queue_size(conn.assigns[:exq_name], :retry)
+      {:ok, scheduled} = Exq.Api.scheduled_size(conn.assigns[:exq_name])
+      {:ok, retrying} = Exq.Api.retry_size(conn.assigns[:exq_name])
+      {:ok, dead} = Exq.Api.failed_size(conn.assigns[:exq_name])
 
       {:ok, queues} = Exq.Api.queue_size(conn.assigns[:exq_name])
 
@@ -55,7 +56,8 @@ defmodule ExqUi.RouterPlug do
       end
       qtotal = "#{Enum.sum(queue_sizes)}"
 
-      {:ok, json} = Poison.encode(%{stat: %{id: "all", processed: processed || 0, failed: failed || 0, busy: busy || 0, scheduled: scheduled || 0, retrying: retrying || 0, enqueued: qtotal}})
+      {:ok, json} = Poison.encode(%{stat: %{id: "all", processed: processed || 0, failed: failed || 0,
+        busy: busy || 0, scheduled: scheduled || 0, dead: dead || 0, retrying: retrying || 0, enqueued: qtotal}})
       conn |> send_resp(200, json) |> halt
     end
 
@@ -63,11 +65,11 @@ defmodule ExqUi.RouterPlug do
       {:ok, failures, successes} = Exq.Api.realtime_stats(conn.assigns[:exq_name])
 
       f = for {date, count} <- failures do
-        %{id: "f#{date}", date: date, count: count, type: "failure"}
+        %{id: "f#{date}", timestamp: date, count: count}
       end
 
       s = for {date, count} <- successes do
-        %{id: "s#{date}", date: date, count: count, type: "success"}
+        %{id: "s#{date}", timestamp: date, count: count}
       end
       all = %{realtimes: f ++ s}
 
@@ -131,12 +133,17 @@ defmodule ExqUi.RouterPlug do
       conn |> send_resp(200, "") |> halt
     end
 
+    put "/api/retries/:id" do
+      :ok = Exq.Api.retry_job(conn.assigns[:exq_name], id)
+      conn |> send_resp(204, "") |> halt
+    end
+
     get "/api/processes" do
       {:ok, processes} = Exq.Api.processes(conn.assigns[:exq_name])
 
       process_jobs = for p <- processes do
         process = Map.delete(p, "job")
-        {:ok, pjob} = Poison.decode(p.job, %{})
+        pjob = p.job
         process = Map.put(process, :job_id, pjob["jid"])
         |> Map.put(:started_at, score_to_time(p.started_at))
         |> Map.put(:id, "#{process.host}:#{process.pid}")
@@ -181,9 +188,9 @@ defmodule ExqUi.RouterPlug do
     EEx.function_from_file :defp, :render_index, index_path, [:assigns]
 
     match _ do
-      base = ""
-      if conn.assigns[:namespace] != "" do
-        base = "#{conn.assigns[:namespace]}/"
+      base = case conn.assigns[:namespace] do
+        "" -> ""
+        namespace -> "#{namespace}/"
       end
 
       conn
@@ -205,14 +212,19 @@ defmodule ExqUi.RouterPlug do
     end
 
     def score_to_time(score) when is_float(score) do
-      date = round(score * 1_000_000)
+      round(score * 1_000_000)
       |> DateTime.from_unix!(:microseconds)
       |> DateTime.to_iso8601
-      date
     end
 
     def score_to_time(score) do
-      score_to_time(String.to_float(score))
+      if String.contains?(score, ".") do
+        score_to_time(String.to_float(score))
+      else
+        String.to_integer(score)
+        |> DateTime.from_unix!
+        |> DateTime.to_iso8601
+      end
     end
 
     def map_score_to_jobs(jobs) do
